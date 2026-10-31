@@ -53,6 +53,7 @@ async function start({ reconquistaLimits, ...options } = {}) {
   const admin = cookies(login);
   return {
     server,
+    store,
     request,
     admin,
     code,
@@ -396,6 +397,48 @@ void test('Made-up cookies and floods from other addresses never block the peopl
       '10.0.0.1',
     );
     assert.equal(watched.statusCode, 200, watched.body);
+  } finally {
+    await app.close();
+  }
+});
+
+void test('Made-up host cookies count against their address before the login is read', async () => {
+  const app = await start();
+  try {
+    let reads = 0;
+    const load = app.store.loadAdminAuth.bind(app.store);
+    app.store.loadAdminAuth = () => {
+      reads++;
+      return load();
+    };
+    const forged = `${app.admin.split('=')[0]}=forged`;
+    const flood = async (url) => {
+      reads = 0;
+      const statuses = await Promise.all(
+        Array.from({ length: 40 }, () =>
+          app.request('GET', url, undefined, { cookie: forged }, '10.0.0.9'),
+        ),
+      );
+      return {
+        refused: statuses.filter((r) => r.statusCode === 429).length,
+        reads,
+      };
+    };
+    for (const url of ['/api/reconquista/games', '/api/admin/games']) {
+      // Only the first 30 in each second reach the saved login.
+      assert.deepEqual(await flood(url), { refused: 10, reads: 30 }, url);
+      // The real host is not affected, and its own checks never add up.
+      for (let i = 0; i < 40; i++) {
+        const host = await app.request(
+          'GET',
+          url,
+          undefined,
+          { cookie: app.admin },
+          '10.0.0.10',
+        );
+        assert.equal(host.statusCode, 200, `${url} ${host.body}`);
+      }
+    }
   } finally {
     await app.close();
   }

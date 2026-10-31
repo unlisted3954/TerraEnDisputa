@@ -99,6 +99,9 @@ type RequestSecurityContext = Pick<
   FastifyRequest,
   'protocol' | 'headers' | 'hostname' | 'cookies'
 >;
+/** Too many host checks from one address; answered with 429. */
+class HostCheckLimitedError extends Error {}
+
 const transportClass = (request: RequestSecurityContext): TransportClass =>
   request.protocol === 'https' ? 'HTTPS' : 'HTTP';
 export function buildServer(options: ServerOptions = {}): FastifyInstance {
@@ -175,6 +178,11 @@ export function buildServer(options: ServerOptions = {}): FastifyInstance {
       );
   });
   server.setErrorHandler((error, request, reply) => {
+    if (error instanceof HostCheckLimitedError)
+      return reply.code(429).send({
+        code: 'RATE_LIMITED',
+        message: 'Too many attempts; try again later',
+      });
     // Fastify's own rejections (broken JSON, oversized or unsupported bodies)
     // are the client's mistake: keep their status and stay out of the error log.
     const status = (error as { statusCode?: unknown }).statusCode;
@@ -280,10 +288,16 @@ export function buildServer(options: ServerOptions = {}): FastifyInstance {
     };
     const hasAdminAuthority = async (request: FastifyRequest) => {
       const token = adminToken(request);
-      return (
-        token !== undefined &&
-        (await auth.authenticateAdmin(token, transportClass(request)))
+      if (token === undefined) return false;
+      const address = addressKey(request.ip);
+      if (!rateLimiter.consume('host-check', address, address))
+        throw new HostCheckLimitedError();
+      const valid = await auth.authenticateAdmin(
+        token,
+        transportClass(request),
       );
+      if (valid) rateLimiter.refund('host-check', address, address);
+      return valid;
     };
     const consumeHttpLimit = (
       request: FastifyRequest,

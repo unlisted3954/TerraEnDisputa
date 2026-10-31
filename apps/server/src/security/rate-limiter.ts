@@ -1,7 +1,12 @@
 import { isIPv6 } from 'node:net';
 
 export type RateLimitSurface =
-  'seat-claim' | 'join' | 'protocol-abuse' | 'game-command' | 'game-read';
+  | 'seat-claim'
+  | 'join'
+  | 'protocol-abuse'
+  | 'game-command'
+  | 'game-read'
+  | 'host-check';
 
 /**
  * Who a request counts as. A valid session counts against its seat (or the
@@ -29,6 +34,10 @@ export const DEFAULT_RATE_LIMIT_POLICIES: Readonly<
   'game-command': { windowMs: 1000, source: 30, target: 120, global: 600 },
   // Every announced change makes each open screen read its view again.
   'game-read': { windowMs: 1000, source: 30, target: 240, global: 1200 },
+  // Each host cookie is checked against the saved login, which waits in the
+  // same queue as the saves. Only cookies that fail stay counted, against
+  // their address, so the real host is never slowed down or locked out.
+  'host-check': { windowMs: 1000, source: 30, target: 30 },
   'protocol-abuse': {
     windowMs: 60_000,
     source: 30,
@@ -77,11 +86,18 @@ export class LayeredRateLimiter {
   // One table per surface and tier: filling one never blocks another.
   private readonly tables = new Map<string, Table>();
 
+  private readonly policies: Readonly<
+    Record<RateLimitSurface, RateLimitPolicy>
+  >;
+
   constructor(
-    private readonly policies = DEFAULT_RATE_LIMIT_POLICIES,
+    // A surface left out keeps its default limit.
+    policies: Partial<Record<RateLimitSurface, RateLimitPolicy>> = {},
     private readonly now: () => number = Date.now,
     private readonly maximumEntries = 4_096,
-  ) {}
+  ) {
+    this.policies = { ...DEFAULT_RATE_LIMIT_POLICIES, ...policies };
+  }
 
   consume(
     surface: RateLimitSurface,
@@ -123,6 +139,22 @@ export class LayeredRateLimiter {
       });
     }
     return true;
+  }
+
+  /** Gives back one use, for a check that turned out to be legitimate. */
+  refund(
+    surface: RateLimitSurface,
+    source: string,
+    target: string,
+    tier: RateLimitTier = 'address',
+  ): void {
+    const table = this.tables.get(`${tier}:${surface}`);
+    const now = this.now();
+    for (const key of [`source:${source}`, `target:${target}`, 'global']) {
+      const counter = table?.counters.get(key);
+      if (counter && counter.expiresAt > now && counter.count > 0)
+        counter.count--;
+    }
   }
 
   private table(name: string): Table {

@@ -297,9 +297,13 @@ export async function registerReconquista(
     );
   const isAdmin = async (r: FastifyRequest) => {
     const token = readSessionCookie(r.cookies, { kind: 'admin' }, transport(r));
-    return (
-      token !== undefined && (await auth.authenticateAdmin(token, transport(r)))
-    );
+    if (token === undefined) return false;
+    const address = addressKey(r.ip);
+    if (!limiter.consume('host-check', address, address))
+      throw new ReconquistaOperationError('RATE_LIMITED');
+    const valid = await auth.authenticateAdmin(token, transport(r));
+    if (valid) limiter.refund('host-check', address, address);
+    return valid;
   };
   const requireAdmin = async (r: FastifyRequest) => {
     if (!(await isAdmin(r)))
@@ -316,8 +320,7 @@ export async function registerReconquista(
     const seat = store.seatOf(id, playerToken(r, id));
     const allowed = seat
       ? limiter.consume(surface, `${id}:${seat}`, id, 'session')
-      : readSessionCookie(r.cookies, { kind: 'admin' }, transport(r)) &&
-          (await isAdmin(r))
+      : (await isAdmin(r))
         ? limiter.consume(surface, 'host', id, 'session')
         : limiter.consume(surface, addressKey(r.ip), id);
     if (!allowed) throw new ReconquistaOperationError('RATE_LIMITED');
@@ -792,7 +795,8 @@ export async function registerReconquista(
           : (store.authenticate(
               current,
               playerToken(request, current.gameId),
-            ) ?? ((await isAdmin(request)) ? 'host' : undefined));
+            ) ??
+            ((await isAdmin(request).catch(() => false)) ? 'host' : undefined));
         if (!current || !viewer) {
           socket.close(1008, 'UNAUTHORIZED');
           return;
